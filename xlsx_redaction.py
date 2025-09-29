@@ -6,7 +6,7 @@ import shutil
 import logging
 import xml.etree.ElementTree as ET
 
-# RULES는 redac_rules.py의 것 사용 (방법 B와 호환)
+# RULES는 redac_rules.py의 것 사용 (패키지/스크립트 양쪽 지원)
 try:
     from .redac_rules import RULES
 except ImportError:
@@ -17,14 +17,14 @@ logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
-    ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
     logger.addHandler(ch)
 
 # Excel main namespace
 NS = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
 # -----------------------------
-# 공통 유틸 (PPTX 버전과 유사)
+# 공통 유틸
 # -----------------------------
 def _merge_overlaps(spans):
     """겹치는 (s,e) 구간 병합"""
@@ -40,13 +40,10 @@ def _merge_overlaps(spans):
             merged.append((s, e))
     return merged
 
-
 def _apply_replacements_to_nodes(nodes, spans, mask="*"):
     """
     nodes: [[node, text], ...]   # node.text 를 가진 텍스트 노드들의 리스트
     spans: [(start, end)]        # 결합 문자열 기준 (start 포함, end 제외)
-    mask: 마스킹 문자 (첫 글자만 사용)
-
     정책:
       - 매칭된 길이만큼 마스킹하되, 하이픈('-')은 그대로 보존
       - 전체 길이는 유지 → 오프셋 보정 불필요
@@ -84,7 +81,6 @@ def _apply_replacements_to_nodes(nodes, spans, mask="*"):
     for node, new_text in nodes:
         node.text = new_text
 
-
 def _find_matches(text: str):
     """RULES로 search + validator → [(pname, (s,e), matched), ...]"""
     matches = []
@@ -104,6 +100,16 @@ def _find_matches(text: str):
                 logger.debug("[MATCH] pattern=%s text='%s' span=%s", pname, val, (m.start(), m.end()))
     return matches
 
+def _rezip_dir(src_dir: str, out_path: str):
+    """src_dir의 '내용'을 ZIP 루트에 그대로 담아 XLSX로 재압축"""
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(src_dir):
+            for fname in files:
+                abs_path = os.path.join(root, fname)
+                arc = os.path.relpath(abs_path, src_dir).replace(os.sep, "/")
+                z.write(abs_path, arc)
 
 # -----------------------------
 # 엑셀(XML) 텍스트 수집 유틸
@@ -116,7 +122,6 @@ def _collect_nodes_shared_string(si):
     반환: [[node, text], ...]
     """
     nodes = []
-    # 리치 텍스트(run) 우선
     runs = si.findall("./s:r", NS)
     if runs:
         for r in runs:
@@ -124,12 +129,10 @@ def _collect_nodes_shared_string(si):
             if t is not None:
                 nodes.append([t, t.text or ""])
         return nodes
-    # 단일 t
     t = si.find("./s:t", NS)
     if t is not None:
         nodes.append([t, t.text or ""])
     return nodes
-
 
 def _collect_nodes_inline_str(cell):
     """
@@ -155,15 +158,10 @@ def _collect_nodes_inline_str(cell):
         nodes.append([t, t.text or ""])
     return nodes
 
-
 # -----------------------------
 # 처리기: sharedStrings.xml
 # -----------------------------
 def _process_shared_strings(tmp_dir: str, mask="*") -> int:
-    """
-    sharedStrings.xml 내부 텍스트 마스킹
-    반환: 처리된 span(매치 그룹) 개수 총합
-    """
     sst_path = os.path.join(tmp_dir, "xl", "sharedStrings.xml")
     if not os.path.exists(sst_path):
         return 0
@@ -192,7 +190,6 @@ def _process_shared_strings(tmp_dir: str, mask="*") -> int:
         logger.info("[sharedStrings] redacted groups: %d", total_spans)
     return total_spans
 
-
 # -----------------------------
 # 처리기: 각 워크시트 (inlineStr)
 # -----------------------------
@@ -214,10 +211,8 @@ def _process_sheets_inline(tmp_dir: str, mask="*") -> int:
         root = tree.getroot()
         changed = False
 
-        # 모든 셀 순회
         for c in root.findall(".//s:c", NS):
-            t_attr = c.get("t")
-            if t_attr != "inlineStr":
+            if c.get("t") != "inlineStr":
                 continue
             nodes = _collect_nodes_inline_str(c)
             if not nodes:
@@ -235,10 +230,9 @@ def _process_sheets_inline(tmp_dir: str, mask="*") -> int:
 
         if changed:
             tree.write(fpath, encoding="utf-8", xml_declaration=True)
-            logger.info("[sheet] %s redacted groups: %d", fname, total_spans)
+            logger.info("[sheet] %s redacted", fname)
 
     return total_spans
-
 
 # -----------------------------
 # 공개 함수
@@ -248,41 +242,57 @@ def redact_xlsx(input_xlsx: str, output_xlsx: str, mask="*"):
     .xlsx 레닥션:
       - sharedStrings.xml의 모든 문자열
       - 각 시트의 inlineStr 문자열
-    에 대해 RULES 기반 탐지 → 숫자/문자 마스킹(하이픈 '-' 보존)
+    에 대해 RULES 기반 탐지 → 길이 유지 마스킹(하이픈 '-' 보존)
     """
     tmp_dir = "xlsx_tmp"
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir)
 
-    # 해제
     with zipfile.ZipFile(input_xlsx, "r") as z:
         z.extractall(tmp_dir)
 
-    # 처리
     total = 0
     total += _process_shared_strings(tmp_dir, mask=mask)
     total += _process_sheets_inline(tmp_dir, mask=mask)
     logger.info("Total redacted groups: %d", total)
 
-    # 재압축
-    if os.path.exists("redacted.zip"):
-        os.remove("redacted.zip")
-    shutil.make_archive("redacted", "zip", tmp_dir)
-
-    # 대상 파일 치환
-    if os.path.exists(output_xlsx):
-        try:
-            os.remove(output_xlsx)
-        except PermissionError:
-            logger.error("Output file is open. Close '%s' and run again.", output_xlsx)
-            raise
-
-    shutil.move("redacted.zip", output_xlsx)
+    _rezip_dir(tmp_dir, output_xlsx)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     logger.info("[DONE] Saved: %s", output_xlsx)
 
+# -----------------------------
+# 배치 실행 진입점
+# -----------------------------
+def _is_candidate(fname: str) -> bool:
+    if not fname.lower().endswith(".xlsx"):
+        return False
+    if fname.startswith("~$"):  # Excel 임시파일 제외
+        return False
+    base, _ = os.path.splitext(fname)
+    if base.lower().endswith("_redacted"):
+        return False
+    return os.path.isfile(fname)
 
 if __name__ == "__main__":
-    # 사용 예시
-    # 하이픈('-')은 보존하고, 매칭된 길이만큼 mask('*')로 치환
-    redact_xlsx("demo_sensitive.xlsx", "demo_redacted.xlsx", mask="*")
+    import sys
+    args = sys.argv[1:]
+    if len(args) >= 1:
+        # 단일 파일 모드
+        src = args[0]
+        dst = args[1] if len(args) >= 2 else "output_redacted.xlsx"
+        redact_xlsx(src, dst, mask="*")
+    else:
+        # 배치 모드: 현재 폴더의 모든 .xlsx 처리
+        files = [f for f in os.listdir(".") if _is_candidate(f)]
+        if not files:
+            print("현재 폴더에 처리할 XLSX가 없습니다.")
+            raise SystemExit(0)
+        for f in files:
+            base, ext = os.path.splitext(f)
+            out = f"{base}_redacted{ext}"
+            try:
+                print(f"[XLSX] {f} → {out}")
+                redact_xlsx(f, out, mask="*")
+            except Exception as e:
+                print(f"[ERROR] {f}: {e}")
