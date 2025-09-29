@@ -6,7 +6,7 @@ import shutil
 import logging
 import xml.etree.ElementTree as ET
 
-# RULES 불러오기 (방법 B: 패키지/스크립트 모두 지원)
+# RULES 불러오기 (패키지/스크립트 둘 다 지원)
 try:
     from .redac_rules import RULES
 except ImportError:
@@ -20,28 +20,28 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
     logger.addHandler(ch)
 
-# 알려진 HWPX 네임스페이스 (폭넓게 대응)
+# 알려진 HWPX 네임스페이스 (방어적 대응)
 NS_LIST = [
     "http://www.hancom.co.kr/hwpml/2011/paragraph",
     "http://www.hancom.co.kr/hwpml/2011/wordprocessor",
     "http://www.hancom.co.kr/hwpml/2011/shared",
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",  # 방어적
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 ]
+
+# 하이픈/대시(보존 대상): - ‐ - ‒ – — ― −
+KEEP = set("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
 
 def _local(tag: str) -> str:
     """{ns}local 형태에서 local만 추출"""
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag
+    return tag.split("}", 1)[1] if "}" in tag else tag
 
 def _iter_hwpx_xml_files(tmp_dir: str):
     """
-    HWPX는 ZIP 안에 Contents/section*.xml 등에 문단/런 텍스트가 들어있음.
-    기본적으로 Contents 아래 모든 .xml을 순회.
+    HWPX는 ZIP 내부 Contents/section*.xml 등에 텍스트가 존재.
+    안전하게 Contents/ 하위 모든 .xml 순회 (없으면 루트 폴더 폴백)
     """
     contents = os.path.join(tmp_dir, "Contents")
     if not os.path.isdir(contents):
-        # 일부 도구는 root 바로 아래 둘 수도 있으므로 폴백
         contents = tmp_dir
     for root, _dirs, files in os.walk(contents):
         for f in files:
@@ -50,32 +50,30 @@ def _iter_hwpx_xml_files(tmp_dir: str):
 
 def _collect_paragraph_nodes(tree: ET.ElementTree):
     """
-    문서에서 문단(<*p>) 단위로 텍스트 런(<*t> 또는 <*text>) 노드를 수집.
-    반환: [ [ [node, text], ... ] , ... ]  # 문단들
+    문단(<*p>) 단위로 텍스트 런(<*t>, <*text>) 수집.
+    반환: 문단 리스트. 각 문단은 [ [node, text], ... ]
     """
     root = tree.getroot()
     paragraphs = []
 
-    # 모든 요소를 순회하며 localname이 'p'인 문단을 찾음
+    # 문단 기준 수집
     for p in root.iter():
         if _local(p.tag) != "p":
             continue
-
-        # 문단 내부에서 텍스트 런 수집 (순서대로)
         nodes = []
         for el in p.iter():
             lname = _local(el.tag)
-            if lname in ("t", "text") and el.text:
+            if lname in ("t", "text") and el.text is not None:
                 nodes.append([el, el.text])
         if nodes:
             paragraphs.append(nodes)
 
-    # 문단을 못 찾았으면, 파일별로 단순히 모든 t/text를 하나의 문단으로 취급 (방어)
+    # 문단이 전혀 없으면 파일 전체에서 t/text를 하나의 문단으로 간주(방어)
     if not paragraphs:
         nodes = []
         for el in root.iter():
             lname = _local(el.tag)
-            if lname in ("t", "text") and el.text:
+            if lname in ("t", "text") and el.text is not None:
                 nodes.append([el, el.text])
         if nodes:
             paragraphs.append(nodes)
@@ -100,7 +98,7 @@ def _apply_replacements_to_nodes(nodes, spans, mask="*"):
     """
     nodes: [[node, text], ...]
     spans: [(start, end)]   # 결합 문자열 기준
-    정책: 매칭된 길이만큼 마스킹하되, 하이픈('-')은 그대로 보존.
+    정책: 매칭된 길이만큼 마스킹하되, 하이픈/대시는 보존.
     """
     mask_char = (mask or "*")[0]
 
@@ -126,7 +124,8 @@ def _apply_replacements_to_nodes(nodes, spans, mask="*"):
             le = max(0, min(ne, e) - ns)
             if ls < le:
                 piece = txt[ls:le]
-                masked = "".join(ch if ch == "-" else mask_char for ch in piece)
+                # 하이픈/대시/공백 보존, 나머지는 마스킹
+                masked = "".join(ch if (ch in KEEP or ch.isspace()) else mask_char for ch in piece)
                 nodes[i][1] = txt[:ls] + masked + txt[le:]
             i += 1
 
@@ -153,11 +152,22 @@ def _find_matches(text: str):
                 logger.debug("[MATCH] %s '%s' span=%s", pname, val, (m.start(), m.end()))
     return matches
 
+def _rezip_dir(src_dir: str, out_path: str):
+    """src_dir의 '내용'을 ZIP 루트에 그대로 담아 HWPX로 재압축"""
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(src_dir):
+            for fname in files:
+                abs_path = os.path.join(root, fname)
+                arc = os.path.relpath(abs_path, src_dir).replace(os.sep, "/")
+                z.write(abs_path, arc)
+
 def redact_hwpx(input_hwpx: str, output_hwpx: str, mask="*"):
     """
     HWPX 레닥션:
-      - Contents 폴더의 모든 XML에서 문단(<*p>)을 찾아 텍스트 런(<*t>, <*text>) 결합
-      - RULES 기반 탐지 → 숫자/문자 마스킹(하이픈 '-' 보존)
+      - Contents 폴더의 모든 XML에서 문단(<*p>) 탐색
+      - 문단 내 텍스트 런(<*t>, <*text>)을 결합 → RULES로 후보 식별 → 길이 유지 마스킹(하이픈/대시 보존)
     """
     tmp_dir = "hwpx_tmp"
     if os.path.exists(tmp_dir):
@@ -200,21 +210,39 @@ def redact_hwpx(input_hwpx: str, output_hwpx: str, mask="*"):
 
     logger.info("[HWPX] files changed=%d, total redacted groups=%d", changed_files, total_spans)
 
-    # 3) 재압축
-    if os.path.exists("redacted.zip"):
-        os.remove("redacted.zip")
-    shutil.make_archive("redacted", "zip", tmp_dir)
-
-    if os.path.exists(output_hwpx):
-        try:
-            os.remove(output_hwpx)
-        except PermissionError:
-            logger.error("Output file is open. Close '%s' and run again.", output_hwpx)
-            raise
-
-    shutil.move("redacted.zip", output_hwpx)
+    # 3) 안전 재압축(루트 구조 보존)
+    _rezip_dir(tmp_dir, output_hwpx)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     logger.info("[DONE] Saved: %s", output_hwpx)
 
+def _is_candidate(fname: str) -> bool:
+    """배치 후보 필터"""
+    if not fname.lower().endswith(".hwpx"):
+        return False
+    base, _ = os.path.splitext(fname)
+    if base.lower().endswith("_redacted"):
+        return False
+    return os.path.isfile(fname)
+
 if __name__ == "__main__":
-    # 사용 예시: 하이픈('-') 보존, 매칭 길이만큼 '*'
-    redact_hwpx("demo_sensitive.hwpx", "demo_redacted.hwpx", mask="*")
+    import sys
+    args = sys.argv[1:]
+    if len(args) >= 1:
+        # 단일 파일
+        src = args[0]
+        dst = args[1] if len(args) >= 2 else "output_redacted.hwpx"
+        redact_hwpx(src, dst, mask="*")
+    else:
+        # 배치: 현재 폴더의 모든 .hwpx 처리
+        files = [f for f in os.listdir(".") if _is_candidate(f)]
+        if not files:
+            print("현재 폴더에 처리할 HWPX가 없습니다.")
+            raise SystemExit(0)
+        for f in files:
+            base, ext = os.path.splitext(f)
+            out = f"{base}_redacted{ext}"
+            try:
+                print(f"[HWPX] {f} → {out}")
+                redact_hwpx(f, out, mask="*")
+            except Exception as e:
+                print(f"[ERROR] {f}: {e}")
