@@ -1,57 +1,76 @@
-# redac_rules.py
 import re
 
-# --- validators 임포트: 패키지/스크립트 실행 모두 지원 (방법 B) ---
+# validators 임포트: 패키지/스크립트 실행 모두 지원
 try:
-    # 패키지로 실행할 때
     from .validators import (
         is_valid_rrn,
+        is_valid_fgn,
         is_valid_phone_mobile,
         is_valid_phone_city,
         is_valid_email,
         is_valid_card,
+        is_valid_driver_license,
     )
 except ImportError:
-    # 단일 스크립트로 실행할 때
     from validators import (
         is_valid_rrn,
+        is_valid_fgn,
         is_valid_phone_mobile,
         is_valid_phone_city,
         is_valid_email,
         is_valid_card,
+        is_valid_driver_license,
     )
 
-# --- 주민등록번호(간단 월/일 범위 반영, 하이픈 선택) ---
-RRN_RE = re.compile(r"(?:\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))-?\d{7}")
+# --- 정규식들 ---
 
-# --- 카드번호 (숫자/하이픈/공백 허용, 15~16 digits) ---
+# 주민등록번호 (내국인)
+RRN_RE = re.compile(
+    r"(?:\d{2}(?:0[1-9]|1[0-2])"      # 연월
+    r"(?:0[1-9]|[12]\d|3[01]))"       # 일
+    r"-?[1234]\d{6}"
+)
+
+# 외국인등록번호
+FGN_RE = re.compile(
+    r"(?:\d{2}(?:0[1-9]|1[0-2])"      # 연월
+    r"(?:0[1-9]|[12]\d|3[01]))"       # 일
+    r"-?[5678]\d{6}"                  # 구분코드(5~8) + 나머지 6자리
+)
+
+# 카드번호 (하이픈/공백 허용, 15~16자리 후보)
 CARD_RE = re.compile(r"(?:\d[ -]?){15,16}")
 
-# --- 이메일 ---
+# 이메일
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
 
-# --- 휴대폰 ---
+# 휴대폰
 MOBILE_RE = re.compile(r"01[016789]-?\d{3,4}-?\d{4}")
 
-# --- 지역번호 ---
+# 지역번호 유선
 CITY_RE = re.compile(r"(?:02|0(?:3[1-3]|4[1-4]|5[1-5]|6[1-4]))-?\d{3,4}-?\d{4}")
 
-# --- 여권번호 (1~2 영문 + 7~8 숫자) ---
-PASSPORT_RE = re.compile(r"[A-Z]{1,2}\d{7,8}")
+# 여권번호 (구/신)
+PASSPORT_RE = re.compile(
+    r"(?:"
+    r"(?:[MSRODG]\d{8})"               # 구여권: M12345678
+    r"|"
+    r"(?:[MSRODG]\d{3}[A-Z]\d{4})"     # 신여권: M123A4567
+    r")"
+)
 
-# --- 운전면허번호 ---
-# 신포맷: NN-NN-NNNNNN-NN
-# 구포맷: NN-NN-NNNNNN (마지막 -NN 생략되는 경우 허용)
-DRIVER_RE = re.compile(r"\d{2}-\d{2}-\d{6}(?:-\d{2})?")
+# 운전면허번호 (구/신 혼용 허용)
+DRIVER_RE = re.compile(r"\d{2}-?\d{2}-?\d{6}-?\d{2}")
 
-# --- 룰 정의 ---
+# --- RULES 매핑 ---
 RULES = {
     "rrn": {
         "regex": RRN_RE,
-        # 요청 options에서 rrn_checksum(기본 True) 반영
-        "validator": lambda v, opts=None: is_valid_rrn(
-            v, use_checksum=(opts or {}).get("rrn_checksum", True)
-        ),
+        "validator": is_valid_rrn,
+    },
+    "fgn": {
+        "regex": FGN_RE,
+        "validator": is_valid_fgn,
     },
     "email": {
         "regex": EMAIL_RE,
@@ -67,26 +86,25 @@ RULES = {
     },
     "card": {
         "regex": CARD_RE,
-        # 카드 옵션(luhn, iin 등) 그대로 전달
-        "validator": lambda v, opts=None: is_valid_card(v, options=opts),
+        "validator": is_valid_card,
     },
     "passport": {
         "regex": PASSPORT_RE,
-        "validator": lambda v, _opts=None: True,
+        "validator": lambda v, _opts=None: True,  # 형식만 맞으면 레닥션
     },
     "driver_license": {
         "regex": DRIVER_RE,
-        "validator": lambda v, _opts=None: True,
+        "validator": is_valid_driver_license,
     },
 }
 
-# --- 프리셋 (API로 노출) ---
+# API 노출용(선택)
 PRESET_PATTERNS = [
-    {"name": "rrn",            "regex": RRN_RE.pattern,        "case_sensitive": False, "whole_word": False},
-    {"name": "email",          "regex": EMAIL_RE.pattern,      "case_sensitive": False, "whole_word": False},
-    {"name": "phone_mobile",   "regex": MOBILE_RE.pattern,     "case_sensitive": False, "whole_word": False},
-    {"name": "phone_city",     "regex": CITY_RE.pattern,       "case_sensitive": False, "whole_word": False},
-    {"name": "card",           "regex": CARD_RE.pattern,       "case_sensitive": False, "whole_word": False},
-    {"name": "passport",       "regex": PASSPORT_RE.pattern,   "case_sensitive": False, "whole_word": False},
-    {"name": "driver_license", "regex": DRIVER_RE.pattern,     "case_sensitive": False, "whole_word": False},
+    {
+        "name": name,
+        "regex": rule["regex"].pattern,
+        "case_sensitive": False,
+        "whole_word": False,
+    }
+    for name, rule in RULES.items()
 ]
